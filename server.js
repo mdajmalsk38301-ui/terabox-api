@@ -92,8 +92,21 @@ app.get('/extract', async (req, res) => {
     }
 
     // Step 2: check + perform transfer into our own account
-    await tb.querySurlTransfer(shareId, fromUk);
+    const transferCheck = await tb.querySurlTransfer(shareId, fromUk);
+    console.log('querySurlTransfer response:', JSON.stringify(transferCheck));
+
+    if (!transferCheck || transferCheck.errno !== 0) {
+      return res.status(502).json({
+        status: 'error',
+        message: 'Transfer eligibility check failed',
+        errno: transferCheck ? transferCheck.errno : null,
+        errmsg: transferCheck ? transferCheck.errmsg : null,
+        raw: transferCheck,
+      });
+    }
+
     const transferResult = await tb.shareTransfer(shareId, fromUk, fsIds, DEST_FOLDER);
+    console.log('shareTransfer response:', JSON.stringify(transferResult));
 
     if (transferResult.errno !== 0) {
       return res.status(502).json({
@@ -101,6 +114,7 @@ app.get('/extract', async (req, res) => {
         message: 'Transfer to account failed',
         errno: transferResult.errno,
         errmsg: transferResult.errmsg,
+        raw: transferResult,
       });
     }
 
