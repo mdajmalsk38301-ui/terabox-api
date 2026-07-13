@@ -22,7 +22,7 @@
  */
 
 import express from 'express';
-import { TeraBoxApp } from 'terabox-api';
+import TeraBoxApp from './lib/api.js';
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -161,4 +161,3 @@ app.get('/extract', async (req, res) => {
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`neofly-terabox-node listening on port ${PORT}`);
 });
-    
