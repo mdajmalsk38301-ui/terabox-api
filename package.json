@@ -1,0 +1,13 @@
+{
+  "name": "neofly-terabox-node",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "terabox-api": "^2.9.2",
+    "express": "^4.19.2"
+  }
+}
