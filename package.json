@@ -7,7 +7,10 @@
     "start": "node server.js"
   },
   "dependencies": {
-    "terabox-api": "^2.9.2",
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "crc-32": "^1.2.2",
+    "filesize": "^11.0.16",
+    "tough-cookie": "^6.0.1",
+    "undici": "^8.1.0"
   }
 }
