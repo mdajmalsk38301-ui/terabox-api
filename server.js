@@ -27,7 +27,7 @@ import TeraBoxApp from './lib/api.js';
 const app = express();
 const PORT = process.env.PORT || 10000;
 const NDUS_COOKIE = process.env.NDUS_COOKIE || '';
-const DEST_FOLDER = '/neofly_temp';
+const DEST_FOLDER = '/neofly_temp_' + Date.now();
 
 function extractSurl(shareUrl) {
   const u = new URL(shareUrl);
@@ -161,4 +161,3 @@ app.get('/extract', async (req, res) => {
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`neofly-terabox-node listening on port ${PORT}`);
 });
-      
