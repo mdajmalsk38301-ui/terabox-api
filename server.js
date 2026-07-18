@@ -22,7 +22,22 @@
  */
 
 import express from 'express';
+import { ProxyAgent, setGlobalDispatcher } from 'undici';
 import TeraBoxApp from './lib/api.js';
+
+// If PROXY_URL is set, route every outgoing request (all of api.js's
+// TeraBox calls use undici under the hood) through it. This is meant to
+// get around TeraBox blocking/restricting requests from known datacenter
+// IP ranges like Render's, the same issue that killed YouTube support.
+//
+// PROXY_URL format: http://username:password@proxyhost:port
+const PROXY_URL = process.env.PROXY_URL;
+if (PROXY_URL) {
+  setGlobalDispatcher(new ProxyAgent(PROXY_URL));
+  console.log('Routing requests through proxy:', PROXY_URL.replace(/:[^:@]+@/, ':***@'));
+} else {
+  console.log('No PROXY_URL set — requests will use Render\'s direct IP.');
+}
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -51,6 +66,96 @@ app.get('/health', (req, res) => {
   res.json({ status: 'healthy', timestamp: new Date().toISOString() });
 });
 
+// Shared extraction logic: given an already-authenticated TeraBoxApp
+// instance, look up the share, transfer it into the account, and return
+// a signed direct download link for the account's own copy.
+async function runExtraction(tb, shareUrl) {
+  const surl = extractSurl(shareUrl);
+  const destFolder = '/neofly_temp_' + Date.now();
+
+  const shareInfo = await tb.shortUrlInfo(surl);
+  if (!shareInfo || shareInfo.errno !== 0) {
+    return { httpStatus: 502, body: {
+      status: 'error', message: 'Could not read share info',
+      errno: shareInfo ? shareInfo.errno : null, errmsg: shareInfo ? shareInfo.errmsg : null,
+    }};
+  }
+
+  const files = shareInfo.list || [];
+  if (!files.length) {
+    return { httpStatus: 404, body: { status: 'error', message: 'No files found in this share' } };
+  }
+
+  const shareId = shareInfo.shareid || shareInfo.share_id;
+  const fromUk = shareInfo.uk;
+  const fsIds = files.map((f) => f.fs_id);
+
+  if (!shareId || !fromUk) {
+    return { httpStatus: 502, body: {
+      status: 'error', message: 'Share response missing shareid/uk — TeraBox response shape may have changed',
+    }};
+  }
+
+  const transferCheck = await tb.querySurlTransfer(shareId, fromUk);
+  console.log('querySurlTransfer response:', JSON.stringify(transferCheck));
+  if (!transferCheck || transferCheck.errno !== 0) {
+    return { httpStatus: 502, body: {
+      status: 'error', message: 'Transfer eligibility check failed',
+      errno: transferCheck ? transferCheck.errno : null, raw: transferCheck,
+    }};
+  }
+
+  const transferResult = await tb.shareTransfer(shareId, fromUk, fsIds, destFolder);
+  console.log('shareTransfer response:', JSON.stringify(transferResult));
+  if (transferResult.errno !== 0) {
+    return { httpStatus: 502, body: {
+      status: 'error', message: 'Transfer to account failed',
+      errno: transferResult.errno, raw: transferResult,
+    }};
+  }
+
+  await new Promise((r) => setTimeout(r, 2500));
+
+  const dirListing = await tb.getRemoteDir(destFolder);
+  if (!dirListing || dirListing.errno !== 0) {
+    return { httpStatus: 502, body: {
+      status: 'error', message: 'Could not list destination folder after transfer',
+      errno: dirListing ? dirListing.errno : null,
+    }};
+  }
+
+  const ownFiles = dirListing.list || [];
+  const originalNames = new Set(files.map((f) => f.server_filename));
+  const matched = ownFiles.filter((f) => originalNames.has(f.server_filename));
+
+  if (!matched.length) {
+    return { httpStatus: 502, body: {
+      status: 'error',
+      message: 'Transferred file not found in destination folder yet — try again in a few seconds',
+    }};
+  }
+
+  const ownFsIds = matched.map((f) => f.fs_id);
+  const downloadResp = await tb.download(ownFsIds);
+  if (!downloadResp || downloadResp.errno !== 0) {
+    return { httpStatus: 502, body: {
+      status: 'error', message: 'Failed to generate download link',
+      errno: downloadResp ? downloadResp.errno : null,
+    }};
+  }
+
+  const dlinkList = downloadResp.dlink || downloadResp.list || [];
+  const result = matched.map((f, i) => ({
+    filename: f.server_filename,
+    size: f.size,
+    download_link: (dlinkList[i] && (dlinkList[i].dlink || dlinkList[i])) || f.dlink || '',
+    thumbnail: (f.thumbs && (f.thumbs.url3 || f.thumbs.icon)) || '',
+  }));
+
+  return { httpStatus: 200, body: { status: 'success', url: shareUrl, files: result } };
+}
+
+// Original approach: reuse a cookie copied from your phone's browser.
 app.get('/extract', async (req, res) => {
   const shareUrl = req.query.url;
   if (!shareUrl) {
@@ -61,113 +166,61 @@ app.get('/extract', async (req, res) => {
   }
 
   try {
-    const surl = extractSurl(shareUrl);
     const tb = new TeraBoxApp(NDUS_COOKIE);
-
-    // Step 1: look up the share
-    const shareInfo = await tb.shortUrlInfo(surl);
-    if (!shareInfo || shareInfo.errno !== 0) {
-      return res.status(502).json({
-        status: 'error',
-        message: 'Could not read share info',
-        errno: shareInfo ? shareInfo.errno : null,
-        errmsg: shareInfo ? shareInfo.errmsg : null,
-      });
-    }
-
-    const files = shareInfo.list || [];
-    if (!files.length) {
-      return res.status(404).json({ status: 'error', message: 'No files found in this share' });
-    }
-
-    const shareId = shareInfo.shareid || shareInfo.share_id;
-    const fromUk = shareInfo.uk;
-    const fsIds = files.map((f) => f.fs_id);
-
-    if (!shareId || !fromUk) {
-      return res.status(502).json({
-        status: 'error',
-        message: 'Share response missing shareid/uk — TeraBox response shape may have changed',
-      });
-    }
-
-    // Step 2: check + perform transfer into our own account
-    const transferCheck = await tb.querySurlTransfer(shareId, fromUk);
-    console.log('querySurlTransfer response:', JSON.stringify(transferCheck));
-
-    if (!transferCheck || transferCheck.errno !== 0) {
-      return res.status(502).json({
-        status: 'error',
-        message: 'Transfer eligibility check failed',
-        errno: transferCheck ? transferCheck.errno : null,
-        errmsg: transferCheck ? transferCheck.errmsg : null,
-        raw: transferCheck,
-      });
-    }
-
-    const transferResult = await tb.shareTransfer(shareId, fromUk, fsIds, DEST_FOLDER);
-    console.log('shareTransfer response:', JSON.stringify(transferResult));
-
-    if (transferResult.errno !== 0) {
-      return res.status(502).json({
-        status: 'error',
-        message: 'Transfer to account failed',
-        errno: transferResult.errno,
-        errmsg: transferResult.errmsg,
-        raw: transferResult,
-      });
-    }
-
-    // Transfers are async server-side — give it a moment to land, then
-    // list our destination folder to find the copied file's own fs_id.
-    await new Promise((r) => setTimeout(r, 2500));
-
-    const dirListing = await tb.getRemoteDir(DEST_FOLDER);
-    if (!dirListing || dirListing.errno !== 0) {
-      return res.status(502).json({
-        status: 'error',
-        message: 'Could not list destination folder after transfer',
-        errno: dirListing ? dirListing.errno : null,
-      });
-    }
-
-    const ownFiles = dirListing.list || [];
-    const originalNames = new Set(files.map((f) => f.server_filename));
-    const matched = ownFiles.filter((f) => originalNames.has(f.server_filename));
-
-    if (!matched.length) {
-      return res.status(502).json({
-        status: 'error',
-        message: 'Transferred file not found in destination folder yet — try again in a few seconds',
-      });
-    }
-
-    // Step 3: get a signed direct download link for our own copy
-    const ownFsIds = matched.map((f) => f.fs_id);
-    const downloadResp = await tb.download(ownFsIds);
-
-    if (!downloadResp || downloadResp.errno !== 0) {
-      return res.status(502).json({
-        status: 'error',
-        message: 'Failed to generate download link',
-        errno: downloadResp ? downloadResp.errno : null,
-      });
-    }
-
-    const dlinkList = downloadResp.dlink || downloadResp.list || [];
-    const result = matched.map((f, i) => ({
-      filename: f.server_filename,
-      size: f.size,
-      download_link:
-        (dlinkList[i] && (dlinkList[i].dlink || dlinkList[i])) ||
-        f.dlink ||
-        '',
-      thumbnail: (f.thumbs && (f.thumbs.url3 || f.thumbs.icon)) || '',
-    }));
-
-    return res.json({ status: 'success', url: shareUrl, files: result });
+    const { httpStatus, body } = await runExtraction(tb, shareUrl);
+    return res.status(httpStatus).json(body);
   } catch (err) {
     console.error('Extraction error:', err);
+    return res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// New approach: log in fresh with email/password, from THIS SAME server,
+// so the session is created and used from the same IP the whole time —
+// never copied from a phone's browser to a different machine. This tests
+// whether today's repeated "need verify" walls were actually a
+// cookie-moved-to-a-new-location security flag rather than pure IP/bot
+// reputation.
+app.get('/extract-login', async (req, res) => {
+  const shareUrl = req.query.url;
+  const email = process.env.TERABOX_EMAIL;
+  const password = process.env.TERABOX_PASSWORD;
+
+  if (!shareUrl) {
+    return res.status(400).json({ status: 'error', message: 'Missing url parameter' });
+  }
+  if (!email || !password) {
+    return res.status(500).json({
+      status: 'error',
+      message: 'Server not configured with TERABOX_EMAIL / TERABOX_PASSWORD',
+    });
+  }
+
+  try {
+    const tb = new TeraBoxApp('', 'ndus'); // start with no cookie at all
+
+    const preLogin = await tb.passportPreLogin(email);
+    console.log('passportPreLogin response:', JSON.stringify(preLogin));
+    if (!preLogin || preLogin.errno !== 0) {
+      return res.status(502).json({
+        status: 'error', message: 'Pre-login failed', errno: preLogin ? preLogin.errno : null, raw: preLogin,
+      });
+    }
+
+    const loginResult = await tb.passportLogin(preLogin.data, email, password);
+    console.log('passportLogin response:', JSON.stringify(loginResult));
+    if (!loginResult || loginResult.errno !== 0) {
+      return res.status(502).json({
+        status: 'error', message: 'Login failed', errno: loginResult ? loginResult.errno : null, raw: loginResult,
+      });
+    }
+
+    // At this point tb.params.cookie should include the freshly-issued
+    // ndus token, set via Set-Cookie headers during login.
+    const { httpStatus, body } = await runExtraction(tb, shareUrl);
+    return res.status(httpStatus).json(body);
+  } catch (err) {
+    console.error('Login-based extraction error:', err);
     return res.status(500).json({ status: 'error', message: err.message });
   }
 });
