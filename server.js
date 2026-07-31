@@ -22,8 +22,13 @@
  */
 
 import express from 'express';
-import { ProxyAgent, setGlobalDispatcher } from 'undici';
+import { Agent, ProxyAgent, setGlobalDispatcher } from 'undici';
 import TeraBoxApp from './lib/api.js';
+import tls from 'node:tls';
+
+// TeraBox requires a specific cipher set to not fail with "need verify_v2"
+// So we configure the global dispatcher to use custom TLS settings.
+const customTls = { ciphers: tls.DEFAULT_CIPHERS + ':!ECDHE-RSA-AES128-SHA' };
 
 // If PROXY_URL is set, route every outgoing request (all of api.js's
 // TeraBox calls use undici under the hood) through it. This is meant to
@@ -33,9 +38,15 @@ import TeraBoxApp from './lib/api.js';
 // PROXY_URL format: http://username:password@proxyhost:port
 const PROXY_URL = process.env.PROXY_URL;
 if (PROXY_URL) {
-  setGlobalDispatcher(new ProxyAgent(PROXY_URL));
+  setGlobalDispatcher(new ProxyAgent({
+    uri: PROXY_URL,
+    requestTls: customTls
+  }));
   console.log('Routing requests through proxy:', PROXY_URL.replace(/:[^:@]+@/, ':***@'));
 } else {
+  setGlobalDispatcher(new Agent({
+    connect: customTls
+  }));
   console.log('No PROXY_URL set — requests will use Render\'s direct IP.');
 }
 
