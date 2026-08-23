@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: terabox-api
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: TERABOX_MODE
+        value: auto
+      - key: MAX_FILE_SIZE
+        value: "2147483648"
+      - key: DOWNLOAD_DIR
+        value: /app/downloads
+      - key: FILE_TTL
+        value: "3600"
+      - key: TERABOX_ACCESS_TOKEN
+        sync: false
+      - key: TERABOX_NDUS
+        sync: false
+      - key: TERABOX_COOKIE
+        sync: false
